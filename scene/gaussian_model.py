@@ -65,6 +65,10 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+    def __len__(self):
+        # 便于日志与调度器直接获取当前高斯体数量
+        return self.get_xyz.shape[0]
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -173,6 +177,24 @@ class GaussianModel:
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+    def create_from_packet(self, packet, cam_list, spatial_lr_scale : float):
+        # 用包初始化高斯体，替代原始点云初始化
+        self.spatial_lr_scale = spatial_lr_scale
+        packet = packet.to("cuda")
+
+        self._xyz = nn.Parameter(packet.xyz.requires_grad_(True))
+        self._features_dc = nn.Parameter(packet.features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(packet.features_rest.requires_grad_(True))
+        self._scaling = nn.Parameter(packet.scaling.requires_grad_(True))
+        self._rotation = nn.Parameter(packet.rotation.requires_grad_(True))
+        self._opacity = nn.Parameter(packet.opacity.requires_grad_(True))
+
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.exposure_mapping = {cam.image_name: idx for idx, cam in enumerate(cam_list)}
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_list), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
     def training_setup(self, training_args):
@@ -385,6 +407,30 @@ class GaussianModel:
 
         return optimizable_tensors
 
+    def add_gaussians(self, packet):
+        # 包投放新增高斯体，并扩展优化器状态
+        packet = packet.to("cuda")
+        new_tensors = {
+            "xyz": packet.xyz,
+            "f_dc": packet.features_dc,
+            "f_rest": packet.features_rest,
+            "opacity": packet.opacity,
+            "scaling": packet.scaling,
+            "rotation": packet.rotation,
+        }
+        optimizable_tensors = self.cat_tensors_to_optimizer(new_tensors)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        new_count = packet.xyz.shape[0]
+        self.xyz_gradient_accum = torch.cat((self.xyz_gradient_accum, torch.zeros((new_count, 1), device="cuda")), dim=0)
+        self.denom = torch.cat((self.denom, torch.zeros((new_count, 1), device="cuda")), dim=0)
+        self.max_radii2D = torch.cat((self.max_radii2D, torch.zeros((new_count,), device="cuda")), dim=0)
+
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
@@ -466,6 +512,19 @@ class GaussianModel:
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
+        torch.cuda.empty_cache()
+
+    def prune(self, min_opacity, extent, max_screen_size=None):
+        # 包投放路径下复用原版的裁剪逻辑
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if not hasattr(self, "tmp_radii") or self.tmp_radii is None:
+            self.tmp_radii = self.max_radii2D.clone()
+        self.prune_points(prune_mask)
+        self.tmp_radii = None
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

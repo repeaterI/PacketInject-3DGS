@@ -97,6 +97,18 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # 包投放式致密化参数
+        self.packet_size = 1000
+        self.init_packets = 1
+        self.packet_radius_scale = 0.02
+        self.packet_reference = "auto"
+        self.packet_auto_switch_ratio = 3.0
+        self.packet_warmup_iter = 0
+        self.psnr_threshold = 21.0
+        self.ema_alpha = 0.3
+        self.sat_window = 3
+        self.sat_delta = 0.3
+        self.position_sampler = "uniform"
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

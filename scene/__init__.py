@@ -12,6 +12,8 @@
 import os
 import random
 import json
+import numpy as np
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -47,6 +49,21 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
         else:
             assert False, "Could not recognize scene type!"
+
+        # 计算场景包围盒，用于包投放的随机采样范围
+        if scene_info.point_cloud is not None and scene_info.point_cloud.points is not None:
+            points = np.asarray(scene_info.point_cloud.points)
+            bbox_min = points.min(axis=0)
+            bbox_max = points.max(axis=0)
+        else:
+            center = -scene_info.nerf_normalization["translate"]
+            radius = scene_info.nerf_normalization["radius"]
+            bbox_min = center - radius
+            bbox_max = center + radius
+        self.bbox_min = torch.tensor(bbox_min, dtype=torch.float32, device="cuda")
+        self.bbox_max = torch.tensor(bbox_max, dtype=torch.float32, device="cuda")
+        self.nerf_normalization = scene_info.nerf_normalization
+        self.camera_center = torch.tensor(-scene_info.nerf_normalization["translate"], dtype=torch.float32, device="cuda")
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
@@ -92,6 +109,13 @@ class Scene:
 
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
             json.dump(exposure_dict, f, indent=2)
+
+    def get_bounding_box(self):
+        # 对外提供包投放所需的场景包围盒
+        return self.bbox_min, self.bbox_max
+
+    def get_camera_center(self):
+        return self.camera_center
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

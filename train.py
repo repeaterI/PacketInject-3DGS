@@ -22,11 +22,15 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
+from utils.logger import DensifyLogger
+from scene.densification import (
+    PacketDensifier,
+    GrowthScheduler,
+    RandomInitializer,
+    UniformRandomSampler,
+    GradientGuidedSampler,
+    PacketSpatialPreprocessor,
+)
 
 try:
     from fused_ssim import fused_ssim
@@ -40,6 +44,12 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+try:
+    from lpipsPyTorch.modules.lpips import LPIPS
+    LPIPS_AVAILABLE = True
+except:
+    LPIPS_AVAILABLE = False
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -49,10 +59,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    packet_preprocessor = PacketSpatialPreprocessor(
+        reference_mode=opt.packet_reference,
+        auto_switch_ratio=opt.packet_auto_switch_ratio,
+    )
+    packet_spatial = packet_preprocessor.resolve(scene)
+    packet_radius = opt.packet_radius_scale * packet_spatial.radius_basis
+    radius_to_extent = packet_radius / max(packet_spatial.cameras_extent, 1e-6)
+    if tb_writer:
+        tb_writer.add_scalar("densify/packet_radius", packet_radius, 0)
+        tb_writer.add_scalar("densify/packet_radius_ratio_to_extent", radius_to_extent, 0)
+    print(
+        f"[Packet] reference={packet_spatial.reference}, bbox_diag={packet_spatial.bbox_diag:.6f}, "
+        f"camera_extent={packet_spatial.cameras_extent:.6f}, center_offset={packet_spatial.center_offset:.6f}, "
+        f"packet_radius={packet_radius:.6f}, ratio_to_extent={radius_to_extent:.6f}"
+    )
+    if radius_to_extent < 0.01 or radius_to_extent > 0.5:
+        print("[Packet] 注意：当前包半径相对相机尺度偏小或偏大，请优先调整 packet_radius_scale 或 packet_reference。")
+
+    packet_densifier = None
+    packet_phase_started = False
+
+    # LPIPS 网络仅在评估阶段使用
+    lpips_model = LPIPS(net_type="vgg").cuda() if LPIPS_AVAILABLE else None
+    if lpips_model is not None:
+        lpips_model.eval()
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -67,6 +104,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    last_eval_psnr = None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -155,7 +193,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            eval_report = training_report(
+                tb_writer,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp),
+                dataset.train_test_exp,
+                lpips_model,
+            )
+            if eval_report and "psnr" in eval_report:
+                last_eval_psnr = eval_report["psnr"]
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -166,9 +219,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                if iteration <= opt.packet_warmup_iter:
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                else:
+                    if not packet_phase_started:
+                        # 从这里开始切换到包投放训练，不改已有高斯，只启用新投放策略
+                        scheduler = GrowthScheduler(
+                            base_packet_size=opt.packet_size,
+                            psnr_threshold=opt.psnr_threshold,
+                            ema_alpha=opt.ema_alpha,
+                            sat_window=opt.sat_window,
+                            sat_delta=opt.sat_delta,
+                        )
+                        if opt.position_sampler == "gradient_guided":
+                            sampler = GradientGuidedSampler(packet_spatial.sample_min, packet_spatial.sample_max, opt.packet_radius_scale)
+                        else:
+                            sampler = UniformRandomSampler(packet_spatial.sample_min, packet_spatial.sample_max)
+                        initializer = RandomInitializer(
+                            packet_spatial.sample_min,
+                            packet_spatial.sample_max,
+                            opt.packet_radius_scale,
+                            gaussians.max_sh_degree,
+                            radius_basis=packet_spatial.radius_basis,
+                        )
+                        packet_densifier = PacketDensifier(
+                            scheduler=scheduler,
+                            sampler=sampler,
+                            initializer=initializer,
+                            logger=tb_writer,
+                            output_dir=dataset.model_path,
+                            save_every=1,
+                        )
+                        packet_phase_started = True
+                        print(f"[Packet] 切换到包投放阶段，warmup_iter={opt.packet_warmup_iter}, reference={packet_spatial.reference}")
+
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and packet_densifier is not None:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        current_psnr = last_eval_psnr if last_eval_psnr is not None else psnr(image, gt_image).mean().item()
+                        # 包投放：依据最近一次评估 PSNR 触发慢启动投放，再保留原版裁剪
+                        packet_densifier.densify(gaussians, current_psnr, iteration)
+                        gaussians.prune(0.005, scene.cameras_extent, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -204,14 +296,13 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
+    tb_writer = DensifyLogger(args.model_path)
+    if not tb_writer:
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, lpips_model=None):
+    report = {}
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -227,6 +318,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -239,17 +332,31 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    if lpips_model is not None:
+                        lpips_test += lpips_model(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                ssim_test /= len(config['cameras'])
+                if lpips_model is not None:
+                    lpips_test /= len(config['cameras'])
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    if lpips_model is not None:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
+                if config['name'] == 'test' and tb_writer:
+                    tb_writer.log_eval(iteration, psnr_test, ssim_test, lpips_test)
+                if config['name'] == 'test':
+                    report["psnr"] = psnr_test.item() if hasattr(psnr_test, "item") else psnr_test
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+    return report
 
 if __name__ == "__main__":
     # Set up command line argument parser
